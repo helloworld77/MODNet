@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 __all__ = [
     'supervised_training_iter',
     'soc_adaptation_iter',
@@ -80,7 +79,9 @@ class GaussianBlurLayer(nn.Module):
 # MODNet Training Functions
 # ----------------------------------------------------------------------------------
 
-blurer = GaussianBlurLayer(1, 3).cuda()
+blurer = GaussianBlurLayer(1, 3)  #.cuda
+if torch.cuda.is_available():
+    blurer.cuda()
 
 
 def supervised_training_iter(
@@ -297,3 +298,59 @@ def soc_adaptation_iter(
     return soc_semantic_loss, soc_detail_loss
 
 # ----------------------------------------------------------------------------------
+
+
+if __name__ == '__main__':
+    from matting_dataset import MattingDataset, Rescale, \
+        ToTensor, Normalize, ToTrainArray, \
+        ConvertImageDtype, GenTrimap
+    from torchvision import transforms
+    from torch.utils.data import DataLoader
+    from models.modnet import MODNet
+    from setting import BS, LR, EPOCHS, SEMANTIC_SCALE, DETAIL_SCALE, MATTE_SCALE, SAVE_EPOCH_STEP
+    transform = transforms.Compose([
+        Rescale(512),
+        GenTrimap(),
+        ToTensor(),
+        ConvertImageDtype(),
+        Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ToTrainArray()
+    ])
+    mattingDataset = MattingDataset(transform=transform)
+
+    modnet = torch.nn.DataParallel(MODNet())  #.cuda()
+    if torch.cuda.is_available():
+        modnet = modnet.cuda()
+
+    optimizer = torch.optim.SGD(modnet.parameters(), lr=LR, momentum=0.9)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.25 * EPOCHS), gamma=0.1)
+
+    dataloader = DataLoader(mattingDataset,
+                            batch_size=BS,
+                            shuffle=True)
+
+    for epoch in range(0, EPOCHS):
+        print(f'epoch: {epoch}/{EPOCHS-1}')
+        for idx, (image, trimap, gt_matte) in enumerate(dataloader):
+            semantic_loss, detail_loss, matte_loss = \
+                supervised_training_iter(modnet, optimizer, image, trimap, gt_matte,
+                                         semantic_scale=SEMANTIC_SCALE,
+                                         detail_scale=DETAIL_SCALE,
+                                         matte_scale=MATTE_SCALE)
+            print(f'{(idx+1) * BS}/{len(mattingDataset)} --- '
+                  f'semantic_loss: {semantic_loss:f}, detail_loss: {detail_loss:f}, matte_loss: {matte_loss:f}\r',
+                  end='')
+        lr_scheduler.step()
+        # 保存中间训练结果
+        if epoch % SAVE_EPOCH_STEP == 0 and epoch > 1:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': modnet.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': {'semantic_loss': semantic_loss, 'detail_loss': detail_loss, 'matte_loss': matte_loss},
+            }, f'pretrained/modnet_custom_portrait_matting_{epoch}_th.ckpt')
+        print(f'{len(mattingDataset)}/{len(mattingDataset)} --- '
+              f'semantic_loss: {semantic_loss:f}, detail_loss: {detail_loss:f}, matte_loss: {matte_loss:f}')
+
+    # 仅保存模型权重参数
+    torch.save(modnet.state_dict(), f'pretrained/modnet_custom_portrait_matting_last_epoch_weight.ckpt')
